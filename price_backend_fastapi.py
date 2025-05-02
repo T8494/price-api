@@ -27,14 +27,19 @@ def search_pricecharting(card_name: str, grade: str):
     for row in results[1:]:  # skip header
         cols = row.find_all("td")
         if len(cols) >= 3:
-            name = cols[0].get_text(strip=True)
-            link = "https://www.pricecharting.com" + cols[0].find("a")["href"]
+            name_tag = cols[0].find("a")
+            name = name_tag.get_text(strip=True) if name_tag else "Unknown"
+            href = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+            if href.startswith("http"):
+                full_url = href
+            else:
+                full_url = "https://www.pricecharting.com" + href
             loose_price = cols[2].get_text(strip=True).replace("$", "").replace(",", "")
             try:
                 loose_price = float(loose_price)
             except:
                 loose_price = None
-            cards.append({"name": name, "url": link, "price": loose_price})
+            cards.append({"name": name, "url": full_url, "price": loose_price})
 
     # Filter for the exact grade if possible
     filtered = [card for card in cards if grade.upper() in card["name"].upper()]
