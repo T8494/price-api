@@ -36,8 +36,10 @@ def get_product_data(product_id: str):
     return response.json()
 
 @app.get("/price", response_model=PriceResponse)
-def get_card_price(name: str = Query(..., description="Card name, e.g., Charizard Base Set"),
-                   grade: str = Query(..., description="Card grade, e.g., PSA 9")):
+def get_card_price(
+    name: str = Query(..., description="Card name, e.g., Charizard Base Set"),
+    grade: str = Query(..., description="Card grade, e.g., PSA 9")
+):
     product = search_product_id(name)
     if not product:
         return {"name": name, "grade": grade, "price": None, "url": ""}
@@ -68,4 +70,4 @@ def get_card_price(name: str = Query(..., description="Card name, e.g., Charizar
         "url": product_url
     }
 
-# NOTE: No uvicorn.run() block to avoid hardcoding port
+# NOTE: uvicorn.run is intentionally removed to let Render handle the port
