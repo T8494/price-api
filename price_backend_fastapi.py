@@ -23,6 +23,7 @@ def search_product_id(card_name: str):
     if response.status_code != 200:
         return None
     results = response.json()
+    print("Search results:", results)
     if not results:
         return None
     return results[0]  # Best match
