@@ -3,7 +3,6 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 import requests
 from typing import Optional
-import uvicorn
 
 app = FastAPI()
 
@@ -37,7 +36,8 @@ def get_product_data(product_id: str):
     return response.json()
 
 @app.get("/price", response_model=PriceResponse)
-def get_card_price(name: str = Query(..., description="Card name, e.g., Charizard Base Set"), grade: str = Query(..., description="Card grade, e.g., PSA 9")):
+def get_card_price(name: str = Query(..., description="Card name, e.g., Charizard Base Set"),
+                   grade: str = Query(..., description="Card grade, e.g., PSA 9")):
     product = search_product_id(name)
     if not product:
         return {"name": name, "grade": grade, "price": None, "url": ""}
@@ -68,5 +68,4 @@ def get_card_price(name: str = Query(..., description="Card name, e.g., Charizar
         "url": product_url
     }
 
-# if __name__ == "__main__":
-# uvicorn.run(app, host="0.0.0.0", port=10000)
+# NOTE: No uvicorn.run() block to avoid hardcoding port
