@@ -2,11 +2,12 @@
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 import requests
-from bs4 import BeautifulSoup
 from typing import Optional
 import uvicorn
 
 app = FastAPI()
+
+API_TOKEN = "196b4a540c432122ca7124335c02a1cdd1253c46"
 
 class PriceResponse(BaseModel):
     name: str
@@ -14,63 +15,56 @@ class PriceResponse(BaseModel):
     price: Optional[float]
     url: str
 
-def get_grade_price_from_product_page(url: str, grade: str):
+def search_product_id(card_name: str):
+    query = card_name.replace(" ", "+")
+    url = f"https://www.pricecharting.com/api/products?search_term={query}&key={API_TOKEN}"
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
+    if response.status_code != 200:
+        return None
+    results = response.json()
+    if not results:
+        return None
+    return results[0]  # Best match
 
-    # Extract title of the card
-    title_tag = soup.find("h1")
-    name = title_tag.get_text(strip=True) if title_tag else "Unknown"
-
-    # Find grading price table
-    table = soup.find("table", id="grades_table")
-    if not table:
-        return name, None
-
-    rows = table.find_all("tr")
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) >= 2:
-            label = cols[0].get_text(strip=True).upper()
-            value = cols[1].get_text(strip=True).replace("$", "").replace(",", "")
-            if grade.upper() in label:
-                try:
-                    return name, float(value)
-                except:
-                    return name, None
-    return name, None
-
-def search_pricecharting(card_name: str, grade: str):
-    query = card_name.replace(" ", "+") + f"+{grade.replace(' ', '+')}"
-    url = f"https://www.pricecharting.com/search-products?q={query}&type=prices"
+def get_product_data(product_id: str):
+    url = f"https://www.pricecharting.com/api/product?id={product_id}&key={API_TOKEN}"
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    results = soup.select("table#games_table tr")
-    for row in results[1:]:  # skip header
-        cols = row.find_all("td")
-        if len(cols) >= 3:
-            name_tag = cols[0].find("a")
-            if not name_tag or "href" not in name_tag.attrs:
-                continue
-            href = name_tag["href"]
-            full_url = href if href.startswith("http") else "https://www.pricecharting.com" + href
-            name, price = get_grade_price_from_product_page(full_url, grade)
-            return {"name": name, "price": price, "url": full_url}
-    return None
+    if response.status_code != 200:
+        return None
+    return response.json()
 
 @app.get("/price", response_model=PriceResponse)
 def get_card_price(name: str = Query(..., description="Card name, e.g., Charizard Base Set"), grade: str = Query(..., description="Card grade, e.g., PSA 9")):
-    result = search_pricecharting(name, grade)
-    if not result:
+    product = search_product_id(name)
+    if not product:
         return {"name": name, "grade": grade, "price": None, "url": ""}
+
+    product_id = product.get("product_id")
+    product_url = f"https://www.pricecharting.com/game/{product_id}"
+    product_name = product.get("product_name", name)
+
+    product_data = get_product_data(product_id)
+    if not product_data:
+        return {"name": product_name, "grade": grade, "price": None, "url": product_url}
+
+    graded_prices = product_data.get("graded_price", {})
+    price = None
+
+    for label, value in graded_prices.items():
+        if grade.upper() in label.upper():
+            try:
+                price = float(value)
+            except:
+                price = None
+            break
+
     return {
-        "name": result["name"],
+        "name": product_name,
         "grade": grade,
-        "price": result["price"],
-        "url": result["url"]
+        "price": price,
+        "url": product_url
     }
 
 if __name__ == "__main__":
