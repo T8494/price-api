@@ -67,5 +67,6 @@ def get_card_price(name: str = Query(..., description="Card name, e.g., Charizar
         "url": product_url
     }
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Only used for local testing
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
