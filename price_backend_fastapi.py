@@ -1,591 +1,340 @@
-from fastapi import FastAPI, Query, Response
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any, Tuple
+from __future__ import annotations
+
 import os
 import re
-import time
 import math
+from typing import Dict, List, Optional, Tuple
+
 import requests
-from requests import RequestException
-from urllib.parse import quote_plus
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 
-app = FastAPI()
-
-# Prefer environment variable on Render; fallback lets you run locally.
-API_TOKEN = os.getenv(
-    "PRICECHARTING_API_TOKEN",
+# -----------------------------
+# Config
+# -----------------------------
+# Read your token from env if set, otherwise use the existing one you provided earlier.
+API_TOKEN = os.environ.get(
+    "PRICECHARTING_KEY",
     "196b4a540c432122ca7124335c02a1cdd1253c46"
 )
 
-# =========================== Models ===========================
+BASE = "https://www.pricecharting.com"
+API_PRODUCTS = f"{BASE}/api/products"
+API_PRODUCT = f"{BASE}/api/product"
+SEARCH_PAGE = f"{BASE}/search-products"
 
-class PriceResponse(BaseModel):
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.7",
+    "Connection": "keep-alive",
+    "Referer": BASE,
+}
+
+app = FastAPI(title="Price API (PriceCharting-backed)")
+
+# -----------------------------
+# Models
+# -----------------------------
+class SearchHit(BaseModel):
+    product_id: str
     name: str
-    grade: str
-    price: Optional[float]
     url: str
-    matched_grade: Optional[str] = None
-    fallback_used: bool = False
-    product_id: Optional[str] = None
-    query_used: Optional[str] = None
+    score: float
+
 
 class PricesResponse(BaseModel):
     name: str
     url: str
     graded_prices: Dict[str, Optional[float]]
 
-# ======================= Small TTL Cache ======================
 
-_CACHE: Dict[str, Tuple[float, Any]] = {}
-CACHE_TTL_SECONDS = 300  # 5 minutes
+class PriceResponse(BaseModel):
+    name: str
+    grade: str
+    price: Optional[float]
+    url: str
 
-def cache_get(key: str):
-    rec = _CACHE.get(key)
-    if not rec:
-        return None
-    ts, value = rec
-    if time.time() - ts > CACHE_TTL_SECONDS:
-        _CACHE.pop(key, None)
-        return None
-    return value
 
-def cache_set(key: str, value: Any):
-    if len(_CACHE) > 1000:
-        _CACHE.clear()
-    _CACHE[key] = (time.time(), value)
+# -----------------------------
+# Helpers: text, matching, HTTP
+# -----------------------------
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+CARDNO_RE = re.compile(r"\b(\d{1,3})\s*/\s*(\d{1,3})\b", re.IGNORECASE)
 
-# =================== Parsing & Scoring Helpers =================
+def normalize_query(q: str) -> str:
+    # remove years (they hurt search sometimes), collapse spaces
+    q = YEAR_RE.sub("", q)
+    # keep slash in card numbers, strip extra punctuation
+    q = re.sub(r"[^\w\s/'\-\[\]]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
 
-def _tokenize(s: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9]+", s.lower()) if s else []
+def tokens(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", s.lower())
 
-def _extract_number_hints(s: str) -> List[str]:
-    if not s:
-        return []
-    parts = []
-    for m in re.findall(r"#?\d+(?:/\d+)?", s):
-        m = m.lstrip("#")
-        parts.append(m)
-        if "/" in m:
-            parts.append(m.split("/", 1)[0])
-    seen, out = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+def contains_all(needles: List[str], hay: str) -> bool:
+    h = hay.lower()
+    return all(n.lower() in h for n in needles if n)
 
-def _parse_name_hints(raw: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
-    if not raw:
-        return raw, None, None, None
+def score_result(name: str, query: str) -> float:
+    """
+    Simple heuristic score:
+    + token overlap
+    + card number presence
+    + edition/shadowless matching
+    """
+    q_tokens = set(tokens(query))
+    n_tokens = set(tokens(name))
+    overlap = len(q_tokens & n_tokens)
 
-    year = None
-    ym = re.search(r"\b(19\d{2}|20\d{2})\b", raw)
-    if ym:
-        year = ym.group(1)
+    score = overlap
 
-    number_hint = None
-    nm = re.search(r"#?\d+(?:/\d+)?", raw)
-    if nm:
-        number_hint = nm.group(0)
+    # card number bonus
+    q_no = CARDNO_RE.search(query)
+    if q_no and CARDNO_RE.search(name):
+        score += 2.5
 
-    cleaned = raw
-    if year:
-        cleaned = re.sub(r"\b" + re.escape(year) + r"\b", "", cleaned)
-    if number_hint:
-        cleaned = cleaned.replace(number_hint, "")
-    cleaned = cleaned.replace("#", "").strip()
-
-    tokens = _tokenize(cleaned)
-    set_hint = None
-    if len(tokens) >= 2:
-        setish = {
-            "set", "base", "fossil", "jungle", "celebrations",
-            "evolving", "skyridge", "neo", "genesis", "discovery",
-            "revelation", "hidden", "fates", "rocket", "legendary",
-            "collection", "gym", "heroes", "challenge", "champions", "path",
-            "darkness", "ablaze", "vivid", "voltage", "shining", "star", "crown", "zenith", "vstar"
-        }
-        if any(t in setish for t in tokens[1:]):
-            set_hint = " ".join(tokens[1:])
-
-    base = raw
-    if year:
-        base = re.sub(r"\b" + re.escape(year) + r"\b", "", base)
-    if number_hint:
-        base = base.replace(number_hint, "")
-    base = re.sub(r"[#()]", " ", base)
-
-    base_tokens = _tokenize(base)
-    if set_hint:
-        set_tokens = set(_tokenize(set_hint))
-        base_tokens = [t for t in base_tokens if t not in set_tokens]
-    base_name = " ".join(base_tokens[:3]) if base_tokens else raw
-
-    return base_name.strip(), set_hint, number_hint, year
-
-def _norm_grade(s: str) -> str:
-    return re.sub(r"(MINT|[^A-Z0-9.])", "", s.upper())
-
-def _brand_and_number(s: str) -> Tuple[Optional[str], Optional[str]]:
-    s_up = s.upper()
-    brand_match = re.match(r"^(PSA|BGS|CGC|SGC)", s_up)
-    num_match = re.search(r"\d+(\.\d+)?", s_up)
-    return (brand_match.group(1) if brand_match else None,
-            num_match.group(0) if num_match else None)
-
-def _score_product(p: Dict[str, Any], base_name: str,
-                   set_hint: Optional[str], number_hint: Optional[str], year_hint: Optional[str]) -> float:
-    title = (p.get("product_name") or p.get("title") or "").lower()
-    tokens_title = _tokenize(title)
-    score = 0.0
-
-    for t in _tokenize(base_name):
-        if t in tokens_title:
-            score += 2.0
-
-    cat = (p.get("category") or "").lower()
-    if any(k in cat for k in ["card", "tcg"]):
+    # edition/shadowless hints
+    if contains_all(["1st", "edition"], query) and "1st edition" in name.lower():
+        score += 2.0
+    if "shadowless" in query.lower() and "shadowless" in name.lower():
         score += 2.0
 
-    if set_hint:
-        for t in _tokenize(set_hint):
-            if t in tokens_title:
-                score += 1.5
-
-    if number_hint:
-        wanted = _extract_number_hints(number_hint)
-        have = _extract_number_hints(title)
-        for n in wanted:
-            if n in have:
-                score += 3.0
-
-    if year_hint and year_hint in title:
+    # slight boost for "base set" when present in both
+    if "base" in q_tokens and "set" in q_tokens and "base" in n_tokens and "set" in n_tokens:
         score += 1.0
 
-    return score
+    return float(score)
 
-# =================== Built-in Mapping (popular cards) =================
-
-CARD_MAP: Dict[str, Dict[str, str]] = {
-    # Base Set (1999)
-    "charizard base set": {"set": "Base Set", "number": "4/102", "year": "1999"},
-    "blastoise base set": {"set": "Base Set", "number": "2/102", "year": "1999"},
-    "venusaur base set": {"set": "Base Set", "number": "15/102", "year": "1999"},
-    "alakazam base set": {"set": "Base Set", "number": "1/102", "year": "1999"},
-    "chansey base set": {"set": "Base Set", "number": "3/102", "year": "1999"},
-    "clefairy base set": {"set": "Base Set", "number": "5/102", "year": "1999"},
-    "gyarados base set": {"set": "Base Set", "number": "6/102", "year": "1999"},
-    "hitmonchan base set": {"set": "Base Set", "number": "7/102", "year": "1999"},
-    "mewtwo base set": {"set": "Base Set", "number": "10/102", "year": "1999"},
-    "nidoking base set": {"set": "Base Set", "number": "11/102", "year": "1999"},
-    "ninetales base set": {"set": "Base Set", "number": "12/102", "year": "1999"},
-    "poliwrath base set": {"set": "Base Set", "number": "13/102", "year": "1999"},
-    "raichu base set": {"set": "Base Set", "number": "14/102", "year": "1999"},
-    "zapdos base set": {"set": "Base Set", "number": "16/102", "year": "1999"},
-
-    # Jungle (1999)
-    "snorlax jungle": {"set": "Jungle", "number": "11/64", "year": "1999"},
-    "scyther jungle": {"set": "Jungle", "number": "10/64", "year": "1999"},
-    "wigglytuff jungle": {"set": "Jungle", "number": "16/64", "year": "1999"},
-    "vaporeon jungle": {"set": "Jungle", "number": "12/64", "year": "1999"},
-    "flareon jungle": {"set": "Jungle", "number": "3/64", "year": "1999"},
-    "jolteon jungle": {"set": "Jungle", "number": "4/64", "year": "1999"},
-    "kangaskhan jungle": {"set": "Jungle", "number": "5/64", "year": "1999"},
-    "mr mime jungle": {"set": "Jungle", "number": "6/64", "year": "1999"},
-    "clefable jungle": {"set": "Jungle", "number": "1/64", "year": "1999"},
-    "nidoqueen jungle": {"set": "Jungle", "number": "7/64", "year": "1999"},
-    "pidgeot jungle": {"set": "Jungle", "number": "8/64", "year": "1999"},
-    "pinsir jungle": {"set": "Jungle", "number": "9/64", "year": "1999"},
-    "venomoth jungle": {"set": "Jungle", "number": "13/64", "year": "1999"},
-    "victreebel jungle": {"set": "Jungle", "number": "14/64", "year": "1999"},
-
-    # Fossil (1999)
-    "dragonite fossil": {"set": "Fossil", "number": "4/62", "year": "1999"},
-    "gengar fossil": {"set": "Fossil", "number": "5/62", "year": "1999"},
-    "articuno fossil": {"set": "Fossil", "number": "2/62", "year": "1999"},
-    "moltres fossil": {"set": "Fossil", "number": "12/62", "year": "1999"},
-    "zapdos fossil": {"set": "Fossil", "number": "15/62", "year": "1999"},
-    "ditto fossil": {"set": "Fossil", "year": "1999"},
-    "kabutops fossil": {"set": "Fossil", "year": "1999"},
-    "lapras fossil": {"set": "Fossil", "year": "1999"},
-    "mewtwo fossil": {"set": "Fossil", "year": "1999"},
-
-    # Team Rocket (2000)
-    "dark charizard team rocket": {"set": "Team Rocket", "number": "4/82", "year": "2000"},
-    "dark blastoise team rocket": {"set": "Team Rocket", "number": "3/82", "year": "2000"},
-    "dark dragonite team rocket": {"set": "Team Rocket", "number": "5/82", "year": "2000"},
-    "dark gyarados team rocket": {"set": "Team Rocket", "number": "8/82", "year": "2000"},
-    "dark alakazam team rocket": {"set": "Team Rocket", "number": "1/82", "year": "2000"},
-    "dark raichu team rocket": {"set": "Team Rocket", "number": "83/82", "year": "2000"},
-
-    # Gym / Neo (2000)
-    "blaine charizard gym challenge": {"set": "Gym Challenge", "year": "2000"},
-    "sabrina gengar gym challenge": {"set": "Gym Challenge", "year": "2000"},
-    "rocket mewtwo gym heroes": {"set": "Gym Heroes", "year": "2000"},
-    "erika venusaur gym heroes": {"set": "Gym Heroes", "year": "2000"},
-    "lugia neo genesis": {"set": "Neo Genesis", "year": "2000"},
-    "typhlosion neo genesis": {"set": "Neo Genesis", "year": "2000"},
-
-    # Legendary / Skyridge
-    "charizard legendary collection": {"set": "Legendary Collection", "year": "2002"},
-    "gengar legendary collection": {"set": "Legendary Collection", "year": "2002"},
-    "charizard skyridge": {"set": "Skyridge", "year": "2003"},
-    "gengar skyridge": {"set": "Skyridge", "year": "2003"},
-
-    # Hidden Fates (2019), Celebrations (2021)
-    "charizard gx hidden fates": {"set": "Hidden Fates", "year": "2019"},
-    "mewtwo gx hidden fates": {"set": "Hidden Fates", "year": "2019"},
-    "charizard celebrations": {"set": "Celebrations", "year": "2021"},
-    "blastoise celebrations": {"set": "Celebrations", "year": "2021"},
-    "venusaur celebrations": {"set": "Celebrations", "year": "2021"},
-    "mew celebrations": {"set": "Celebrations", "year": "2021"},
-
-    # Modern numbered examples
-    "charizard vmax darkness ablaze": {"set": "Darkness Ablaze", "number": "020/189", "year": "2020"},
-    "pikachu vmax vivid voltage": {"set": "Vivid Voltage", "number": "044/185", "year": "2020"},
-    "charizard v star universe": {"set": "VSTAR Universe", "year": "2022"},
-    "charizard crown zenith": {"set": "Crown Zenith", "year": "2023"},
-}
-
-def _normalize_key(s: str) -> str:
-    return " ".join(_tokenize(s))
-
-def mapping_hints(name: str) -> Optional[Dict[str, str]]:
-    key = _normalize_key(name)
-    if key in CARD_MAP:
-        return CARD_MAP[key]
-    best = None
-    for k, v in CARD_MAP.items():
-        if key.startswith(k) or k in key:
-            if not best or len(k) > len(best[0]):
-                best = (k, v)
-    return best[1] if best else None
-
-# =================== PriceCharting HTTP Helpers =================
-
-def _http_json(url: str) -> Any:
-    cache_key = f"HTTP::{url}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
-    headers = {"User-Agent": "Mozilla/5.0"}
+def http_get_json(url: str, params: dict) -> Optional[dict | list]:
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        cache_set(cache_key, data)
-        return data
-    except (RequestException, ValueError):
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except requests.RequestException:
         return None
 
-def search_products(query: str) -> List[Dict[str, Any]]:
-    # Proper URL-encoding for PriceCharting queries
-    url = f"https://www.pricecharting.com/api/products?search_term={quote_plus(query)}&key={API_TOKEN}"
-    data = _http_json(url)
-    return data or []
+def http_get_html(url: str, params: dict) -> Optional[str]:
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            return r.text
+        return None
+    except requests.RequestException:
+        return None
 
-def search_product_smart(card_name: str,
-                         set_hint: Optional[str],
-                         number_hint: Optional[str],
-                         year_hint: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    variants = [
-        (card_name, set_hint, number_hint, year_hint),
-        (card_name, set_hint, number_hint, None),
-        (card_name, set_hint, None, year_hint),
-        (card_name, set_hint, None, None),
-        (card_name, None, number_hint, year_hint),
-        (card_name, None, number_hint, None),
-        (card_name, None, None, year_hint),
-        (card_name, None, None, None),
-    ]
 
-    best = None
-    best_score = -math.inf
-    best_query_str = None
-
-    for nm, st, num, yr in variants:
-        q = " ".join(x for x in [nm, st, num, yr] if x)
-        results = search_products(q)
-        if not results:
-            continue
-        for p in results[:25]:
-            sc = _score_product(p, nm, st, num, yr)
-            if sc > best_score:
-                best, best_score = p, sc
-                best_query_str = q
-        if best_score >= 7.0:
-            break
-
-    return best, best_query_str
-
-def get_product_data(product_id: str):
-    url = f"https://www.pricecharting.com/api/product?id={product_id}&key={API_TOKEN}"
-    cache_key = f"PRODUCT::{product_id}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
-    data = _http_json(url)
-    if data is not None:
-        cache_set(cache_key, data)
+# -----------------------------
+# PriceCharting lookups
+# -----------------------------
+def api_search_products(query: str) -> List[dict]:
+    data = http_get_json(API_PRODUCTS, {"search_term": query, "key": API_TOKEN})
+    if not isinstance(data, list):
+        return []
     return data
 
-# ===================== Grade Fallback Helper ====================
+def select_best_product(results: List[dict], user_query: str) -> Optional[dict]:
+    if not results:
+        return None
+    # Score each candidate by name
+    scored: List[Tuple[float, dict]] = []
+    for item in results:
+        name = item.get("product_name") or item.get("console_name") or ""
+        s = score_result(name, user_query)
+        scored.append((s, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # require minimal score
+    best_score, best_item = scored[0]
+    if best_score <= 0:
+        return None
+    return best_item
 
-def _closest_grade(target_brand: Optional[str], target_num: Optional[str],
-                   graded_prices: Dict[str, Any]) -> Optional[Tuple[str, Optional[float]]]:
-    def to_float(v):
-        try:
-            return float(v) if v not in (None, "", "N/A") else None
-        except (TypeError, ValueError):
-            return None
+def scrape_search_for_slug(query: str) -> Optional[str]:
+    """
+    Fallback: open the search page and grab the first product slug after '/game/'.
+    We use that slug as `product_id` for the /api/product endpoint.
+    """
+    html = http_get_html(SEARCH_PAGE, {"q": query})
+    if not html:
+        return None
 
-    same: List[Tuple[float, str, Optional[float]]] = []
-    anyb: List[Tuple[float, str, Optional[float]]] = []
-
-    tgt = None
-    try:
-        tgt = float(target_num) if target_num else None
-    except ValueError:
-        pass
-
-    for label, val in graded_prices.items():
-        b, n = _brand_and_number(label)
-        try:
-            n_float = float(n) if n else None
-        except ValueError:
-            n_float = None
-        if n_float is None:
-            continue
-        dist = abs(n_float - tgt) if tgt is not None else 999.0
-        entry = (dist, label, to_float(val))
-        if target_brand and b == target_brand:
-            same.append(entry)
-        else:
-            anyb.append(entry)
-
-    same.sort(key=lambda x: x[0])
-    anyb.sort(key=lambda x: x[0])
-
-    for _, lbl, price in same + anyb:
-        return (lbl, price)
+    # Simple href extraction to avoid fragile full HTML parsing
+    # Look for links like href="/game/pokemon-base-set/charizard-4"
+    m = re.search(r'href="(/game/[^"#?]+)"', html, flags=re.IGNORECASE)
+    if not m:
+        return None
+    path = m.group(1)
+    # convert to product_id expected by the API: everything after '/game/'
+    if path.lower().startswith("/game/"):
+        return path[len("/game/"):]
     return None
 
-# ========================== Routes =============================
+def api_get_product(product_id: str) -> Optional[dict]:
+    data = http_get_json(API_PRODUCT, {"id": product_id, "key": API_TOKEN})
+    if not isinstance(data, dict):
+        return None
+    return data
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "price-api", "version": "1.4"}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/search")
-def search(
-    response: Response,
-    name: str = Query(..., description="Card name (can include set/number/year)"),
-    set: Optional[str] = None,
-    number: Optional[str] = None,
-    year: Optional[str] = None,
-    limit: int = 5
-):
-    base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
-    m = mapping_hints(base_name)
-    if m:
-        set = set or m.get("set")
-        number = number or m.get("number")
-        year = year or m.get("year")
-    set = set or auto_set
-    number = number or auto_num
-    year = year or auto_year
-
-    # Try multiple query variants and aggregate
-    variants = [
-        (base_name, set, number, year),
-        (base_name, set, number, None),
-        (base_name, set, None, year),
-        (base_name, set, None, None),
-        (base_name, None, number, year),
-        (base_name, None, number, None),
-        (base_name, None, None, year),
-        (base_name, None, None, None),
-        (name, None, None, None),  # raw input as a last resort
-    ]
-
-    agg: Dict[str, Dict[str, Any]] = {}
-    tried: List[str] = []
-
-    for nm, st, num, yr in variants:
-        q = " ".join(x for x in [nm, st, num, yr] if x)
-        if not q or q in tried:
-            continue
-        tried.append(q)
-
-        results = search_products(q)
-        for p in results or []:
-            pid = str(p.get("product_id") or "")
-            if not pid:
-                continue
-            score = _score_product(p, nm, st, num, yr)
-            rec = agg.get(pid)
-            if not rec or score > rec["score"]:
-                agg[pid] = {
-                    "product_id": pid,
-                    "product_name": p.get("product_name"),
-                    "url": p.get("url") or (f"https://www.pricecharting.com/game/{pid}" if pid else ""),
-                    "category": p.get("category"),
-                    "score": round(score, 2),
-                    "query_used": q,
-                }
-
-    ranked = sorted(agg.values(), key=lambda x: x["score"], reverse=True)[: max(1, min(20, limit))]
-
-    response.headers["X-Mapping-Hit"] = "true" if m else "false"
-    response.headers["X-Queries-Tried"] = " | ".join(tried[:10])
-    return ranked
-
-@app.get("/price", response_model=PriceResponse)
-def get_card_price(
-    name: str = Query(..., description="Card name (you can include set/number/year)"),
-    grade: str = Query(..., description="Card grade, e.g., PSA 9"),
-    set: Optional[str] = Query(None, description="Set hint, e.g., Base Set, Fossil, Celebrations"),
-    number: Optional[str] = Query(None, description="Card number, e.g., 10 or 4/102"),
-    year: Optional[str] = Query(None, description="Year hint, e.g., 1999"),
-    allow_fallback: bool = Query(True, description="Use nearest grade if exact grade not found"),
-    response: Response = None,
-):
-    base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
-    mapping = mapping_hints(base_name)
-    if mapping:
-        set = set or mapping.get("set")
-        number = number or mapping.get("number")
-        year = year or mapping.get("year")
-    set = set or auto_set
-    number = number or auto_num
-    year = year or auto_year
-
-    product, query_used = search_product_smart(base_name, set, number, year)
-    if not product:
-        if response:
-            response.headers["X-Price-Fallback"] = "false"
-            response.headers["X-Matched-Grade"] = ""
-            response.headers["X-Product-Id"] = ""
-            response.headers["X-Query-Used"] = base_name
-            response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
-        return {"name": name, "grade": grade, "price": None, "url": "", "query_used": base_name}
-
-    product_id = product.get("product_id")
-    product_url = product.get("url") or (f"https://www.pricecharting.com/game/{product_id}" if product_id else "")
-    product_name = product.get("product_name", base_name)
-
-    data = get_product_data(product_id) if product_id else None
-    if not data:
-        if response:
-            response.headers["X-Price-Fallback"] = "false"
-            response.headers["X-Matched-Grade"] = ""
-            response.headers["X-Product-Id"] = product_id or ""
-            response.headers["X-Query-Used"] = query_used or base_name
-            response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
-        return {
-            "name": product_name, "grade": grade, "price": None,
-            "url": product_url, "product_id": product_id, "query_used": query_used or base_name
-        }
-
-    graded_prices = data.get("graded_price", {}) or {}
-
-    price: Optional[float] = None
-    matched_label: Optional[str] = None
-    fallback_used = False
-
-    target_norm = _norm_grade(grade)
-    target_brand, target_num = _brand_and_number(grade)
-
-    # 1) Exact normalized label match
-    for label, value in graded_prices.items():
-        label_norm = _norm_grade(label)
-        if label_norm == target_norm or label_norm.replace(".", "") == target_norm.replace(".", ""):
-            try:
-                price = float(value) if value not in (None, "", "N/A") else None
-            except (TypeError, ValueError):
-                price = None
-            matched_label = label
-            break
-
-    # 2) Brand + numeric match
-    if price is None and target_brand and target_num:
-        for label, value in graded_prices.items():
-            label_brand, label_num = _brand_and_number(label)
-            if label_brand and label_num and label_brand == target_brand and label_num == target_num:
-                try:
-                    price = float(value) if value not in (None, "", "N/A") else None
-                except (TypeError, ValueError):
-                    price = None
-                matched_label = label
-                break
-
-    # 3) Closest-grade fallback
-    if price is None and allow_fallback:
-        fb = _closest_grade(target_brand, target_num, graded_prices)
-        if fb:
-            matched_label, price = fb
-            fallback_used = True
-
-    if response:
-        response.headers["X-Price-Fallback"] = "true" if fallback_used else "false"
-        response.headers["X-Matched-Grade"] = matched_label or ""
-        response.headers["X-Product-Id"] = product_id or ""
-        response.headers["X-Query-Used"] = query_used or base_name
-        response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
-
-    return {
-        "name": product_name,
-        "grade": grade,
-        "price": price,
-        "url": product_url,
-        "matched_grade": matched_label,
-        "fallback_used": fallback_used,
-        "product_id": product_id,
-        "query_used": query_used or base_name
-    }
-
-@app.get("/prices", response_model=PricesResponse)
-def get_all_prices(
-    name: str = Query(..., description="Card name (you can include set/number/year)"),
-    set: Optional[str] = Query(None, description="Set hint"),
-    number: Optional[str] = Query(None, description="Card number"),
-    year: Optional[str] = Query(None, description="Year hint"),
-):
-    base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
-    mapping = mapping_hints(base_name)
-    if mapping:
-        set = set or mapping.get("set")
-        number = number or mapping.get("number")
-        year = year or mapping.get("year")
-    set = set or auto_set
-    number = number or auto_num
-    year = year or auto_year
-
-    product, _ = search_product_smart(base_name, set, number, year)
-    if not product:
-        return {"name": name, "url": "", "graded_prices": {}}
-
-    product_id = product.get("product_id")
-    product_url = product.get("url") or (f"https://www.pricecharting.com/game/{product_id}" if product_id else "")
-    product_name = product.get("product_name", base_name)
-
-    data = get_product_data(product_id) if product_id else None
-    if not data:
-        return {"name": product_name, "url": product_url, "graded_prices": {}}
-
+def graded_map_from_product(data: dict) -> Dict[str, Optional[float]]:
+    """
+    PriceCharting API returns 'graded_price' as a dict-like object where keys
+    are like 'PSA 10', 'PSA 9', 'BGS 9.5', 'CGC 9', etc. Normalize to uniform keys.
+    """
     out: Dict[str, Optional[float]] = {}
-    for label, value in (data.get("graded_price", {}) or {}).items():
-        try:
-            out[label] = float(value) if value not in (None, "", "N/A") else None
-        except (TypeError, ValueError):
-            out[label] = None
+    g = data.get("graded_price") or {}
+    if isinstance(g, dict):
+        for k, v in g.items():
+            key = str(k).strip()
+            try:
+                val = float(v) if v is not None and v != "" else None
+            except Exception:
+                val = None
+            out[key] = val
+    return out
 
-    return {"name": product_name, "url": product_url, "graded_prices": out}
+def build_product_url(product_id: str) -> str:
+    # Product pages are under /game/{slug}
+    return f"{BASE}/game/{product_id}"
 
-# NOTE: No uvicorn.run() block — Render starts Uvicorn with its own $PORT.
+
+# -----------------------------
+# Grade matching
+# -----------------------------
+def normalize_grade_label(label: str) -> str:
+    # unify spaces and case, keep decimals
+    t = re.sub(r"\s+", "", label.upper())
+    return t
+
+def find_grade_price(graded: Dict[str, Optional[float]], ask: str) -> Optional[float]:
+    """
+    Ask can be 'PSA 9', 'psa9', 'BGS 9.5', 'CGC 10', etc.
+    We match ignoring spaces/case.
+    """
+    if not graded:
+        return None
+    want = normalize_grade_label(ask)
+    # direct match first
+    for k, v in graded.items():
+        if normalize_grade_label(k) == want:
+            return v
+
+    # fallback: tolerate missing space variants ("PSA9" vs "PSA 9")
+    # also handle 'PSA Gem Mint 10' styles, by extracting number and brand
+    m = re.match(r"(PSA|BGS|CGC)\s*([0-9]+(?:\.[05])?)", ask.strip(), flags=re.IGNORECASE)
+    if m:
+        brand = m.group(1).upper()
+        num = m.group(2)
+        candidates = []
+        for k, v in graded.items():
+            nk = normalize_grade_label(k)
+            if nk.startswith(brand) and re.search(rf"{re.escape(num)}$", nk):
+                candidates.append(v)
+        if candidates:
+            # any candidate is fine; usually only one
+            for c in candidates:
+                return c
+    return None
+
+
+# -----------------------------
+# Public endpoints
+# -----------------------------
+@app.get("/", tags=["meta"])
+def root():
+    return {"ok": True, "endpoints": ["/search", "/prices", "/price", "/health"]}
+
+@app.get("/health", tags=["meta"])
+def health():
+    # lightweight check: token present
+    return {"ok": True, "has_token": bool(API_TOKEN)}
+
+@app.get("/search", response_model=List[SearchHit], tags=["search"])
+def search(name: str = Query(..., description="Card query, e.g. 'Charizard Base Set 4/102 1st Edition'")):
+    """
+    Returns a small list of likely matches with a score so you can choose.
+    """
+    if not name.strip():
+        return []
+
+    q = normalize_query(name)
+    hits: List[SearchHit] = []
+
+    # 1) API search
+    api_results = api_search_products(q)
+    for r in api_results[:10]:
+        pid = r.get("product_id")
+        pname = r.get("product_name") or ""
+        if not pid or not pname:
+            continue
+        s = score_result(pname, q)
+        hits.append(SearchHit(
+            product_id=pid,
+            name=pname,
+            url=build_product_url(pid),
+            score=s
+        ))
+
+    # 2) Fallback: scrape first slug if API empty
+    if not hits:
+        slug = scrape_search_for_slug(q)
+        if slug:
+            pname = normalize_query(name)
+            hits.append(SearchHit(
+                product_id=slug,
+                name=pname,
+                url=build_product_url(slug),
+                score=0.5
+            ))
+
+    # sort by score desc
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return hits
+
+@app.get("/prices", response_model=PricesResponse, tags=["prices"])
+def get_all_prices(name: str = Query(..., description="Card query, e.g., 'Charizard Base Set 4/102 1999'")):
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+
+    q = normalize_query(name)
+
+    # Try API search -> best item
+    best = select_best_product(api_search_products(q), q)
+
+    # Fallback: scrape slug from search page
+    if not best:
+        slug = scrape_search_for_slug(q)
+        if slug:
+            best = {"product_id": slug, "product_name": q}
+
+    if not best:
+        return PricesResponse(name=name, url="", graded_prices={})
+
+    pid = best["product_id"]
+    pdata = api_get_product(pid)
+    if not pdata:
+        return PricesResponse(name=best.get("product_name", name), url=build_product_url(pid), graded_prices={})
+
+    graded = graded_map_from_product(pdata)
+    return PricesResponse(
+        name=pdata.get("product_name", best.get("product_name", name)),
+        url=build_product_url(pid),
+        graded_prices=graded
+    )
+
+@app.get("/price", response_model=PriceResponse, tags=["prices"])
+def get_single_price(
+    name: str = Query(..., description="Card query, e.g., 'Charizard Base Set 4/102 1999'"),
+    grade: str = Query(..., description="Grade, e.g., 'PSA 9', 'BGS 9.5', 'CGC 10'")
+):
+    allp = get_all_prices(name)
+    price = find_grade_price(allp.graded_prices, grade)
+    return PriceResponse(
+        name=allp.name,
+        grade=grade,
+        price=price,
+        url=allp.url
+    )
