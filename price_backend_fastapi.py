@@ -107,7 +107,8 @@ def _parse_name_hints(raw: str) -> Tuple[str, Optional[str], Optional[str], Opti
             "set", "base", "fossil", "jungle", "celebrations",
             "evolving", "skyridge", "neo", "genesis", "discovery",
             "revelation", "hidden", "fates", "rocket", "legendary",
-            "collection", "gym", "heroes", "challenge", "champions", "path"
+            "collection", "gym", "heroes", "challenge", "champions", "path",
+            "darkness", "ablaze", "vivid", "voltage", "shining", "star"
         }
         if any(t in setish for t in tokens[1:]):
             set_hint = " ".join(tokens[1:])
@@ -174,6 +175,115 @@ def _score_product(p: Dict[str, Any], base_name: str,
         score += 1.0
 
     return score
+
+# =================== Built-in Mapping (common cards) =================
+# Numbers included where reliable. Otherwise we provide set+year to guide search.
+CARD_MAP: Dict[str, Dict[str, str]] = {
+    # Base Set (1999) - popular holos
+    "charizard base set": {"set": "Base Set", "number": "4/102", "year": "1999"},
+    "blastoise base set": {"set": "Base Set", "number": "2/102", "year": "1999"},
+    "venusaur base set": {"set": "Base Set", "number": "15/102", "year": "1999"},
+    "alakazam base set": {"set": "Base Set", "number": "1/102", "year": "1999"},
+    "chansey base set": {"set": "Base Set", "number": "3/102", "year": "1999"},
+    "clefairy base set": {"set": "Base Set", "number": "5/102", "year": "1999"},
+    "gyarados base set": {"set": "Base Set", "number": "6/102", "year": "1999"},
+    "hitmonchan base set": {"set": "Base Set", "number": "7/102", "year": "1999"},
+    "machamp base set": {"set": "Base Set", "year": "1999"},  # number varies w/ theme deck
+    "mewtwo base set": {"set": "Base Set", "number": "10/102", "year": "1999"},
+    "nidoking base set": {"set": "Base Set", "number": "11/102", "year": "1999"},
+    "ninetales base set": {"set": "Base Set", "number": "12/102", "year": "1999"},
+    "poliwrath base set": {"set": "Base Set", "number": "13/102", "year": "1999"},
+    "raichu base set": {"set": "Base Set", "number": "14/102", "year": "1999"},
+    "zapdos base set": {"set": "Base Set", "number": "16/102", "year": "1999"},
+
+    # Jungle (1999)
+    "snorlax jungle": {"set": "Jungle", "number": "11/64", "year": "1999"},
+    "scyther jungle": {"set": "Jungle", "number": "10/64", "year": "1999"},
+    "wigglytuff jungle": {"set": "Jungle", "number": "16/64", "year": "1999"},
+    "vaporeon jungle": {"set": "Jungle", "number": "12/64", "year": "1999"},
+    "flareon jungle": {"set": "Jungle", "number": "3/64", "year": "1999"},
+    "jolteon jungle": {"set": "Jungle", "number": "4/64", "year": "1999"},
+    "kangaskhan jungle": {"set": "Jungle", "number": "5/64", "year": "1999"},
+    "mr mime jungle": {"set": "Jungle", "number": "6/64", "year": "1999"},
+    "clefable jungle": {"set": "Jungle", "number": "1/64", "year": "1999"},
+    "nidoqueen jungle": {"set": "Jungle", "number": "7/64", "year": "1999"},
+    "pidgeot jungle": {"set": "Jungle", "number": "8/64", "year": "1999"},
+    "pinsir jungle": {"set": "Jungle", "number": "9/64", "year": "1999"},
+    "venomoth jungle": {"set": "Jungle", "number": "13/64", "year": "1999"},
+    "victreebel jungle": {"set": "Jungle", "number": "14/64", "year": "1999"},
+
+    # Fossil (1999) – some with numbers, rest guide by set/year
+    "dragonite fossil": {"set": "Fossil", "number": "4/62", "year": "1999"},
+    "gengar fossil": {"set": "Fossil", "number": "5/62", "year": "1999"},
+    "articuno fossil": {"set": "Fossil", "number": "2/62", "year": "1999"},
+    "moltres fossil": {"set": "Fossil", "number": "12/62", "year": "1999"},
+    "zapdos fossil": {"set": "Fossil", "number": "15/62", "year": "1999"},
+    "ditto fossil": {"set": "Fossil", "year": "1999"},
+    "kabutops fossil": {"set": "Fossil", "year": "1999"},
+    "lapras fossil": {"set": "Fossil", "year": "1999"},
+    "mewtwo fossil": {"set": "Fossil", "year": "1999"},
+
+    # Team Rocket (2000)
+    "dark charizard team rocket": {"set": "Team Rocket", "number": "4/82", "year": "2000"},
+    "dark blastoise team rocket": {"set": "Team Rocket", "number": "3/82", "year": "2000"},
+    "dark dragonite team rocket": {"set": "Team Rocket", "number": "5/82", "year": "2000"},
+    "dark gyarados team rocket": {"set": "Team Rocket", "number": "8/82", "year": "2000"},
+    "dark alakazam team rocket": {"set": "Team Rocket", "number": "1/82", "year": "2000"},
+    "dark raichu team rocket": {"set": "Team Rocket", "number": "83/82", "year": "2000"},
+
+    # Gym Heroes / Challenge (2000)
+    "blaine charizard gym challenge": {"set": "Gym Challenge", "year": "2000"},
+    "sabrina gengar gym challenge": {"set": "Gym Challenge", "year": "2000"},
+    "rocket mewtwo gym heroes": {"set": "Gym Heroes", "year": "2000"},
+    "erika venusaur gym heroes": {"set": "Gym Heroes", "year": "2000"},
+
+    # Neo Genesis (2000)
+    "lugia neo genesis": {"set": "Neo Genesis", "year": "2000"},
+    "typhlosion neo genesis": {"set": "Neo Genesis", "year": "2000"},
+    "feraligatr neo genesis": {"set": "Neo Genesis", "year": "2000"},
+
+    # Legendary Collection (2002)
+    "charizard legendary collection": {"set": "Legendary Collection", "year": "2002"},
+    "gengar legendary collection": {"set": "Legendary Collection", "year": "2002"},
+
+    # Skyridge (2003)
+    "charizard skyridge": {"set": "Skyridge", "year": "2003"},
+    "gengar skyridge": {"set": "Skyridge", "year": "2003"},
+
+    # Hidden Fates (2019)
+    "charizard gx hidden fates": {"set": "Hidden Fates", "year": "2019"},
+    "mewtwo gx hidden fates": {"set": "Hidden Fates", "year": "2019"},
+
+    # Celebrations (2021)
+    "charizard celebrations": {"set": "Celebrations", "year": "2021"},
+    "blastoise celebrations": {"set": "Celebrations", "year": "2021"},
+    "venusaur celebrations": {"set": "Celebrations", "year": "2021"},
+    "mew celebrations": {"set": "Celebrations", "year": "2021"},
+
+    # Modern examples w/ numbers
+    "charizard vmax darkness ablaze": {"set": "Darkness Ablaze", "number": "020/189", "year": "2020"},
+    "pikachu vmax vivid voltage": {"set": "Vivid Voltage", "number": "044/185", "year": "2020"},
+    "charizard v star universe": {"set": "VSTAR Universe", "year": "2022"},
+    "charizard crown zenith": {"set": "Crown Zenith", "year": "2023"},
+}
+
+def _normalize_key(s: str) -> str:
+    return " ".join(_tokenize(s))
+
+def mapping_hints(name: str) -> Optional[Dict[str, str]]:
+    """
+    Try exact normalized key, then longest substring match.
+    Returns dict with any of set/number/year if found.
+    """
+    key = _normalize_key(name)
+    if key in CARD_MAP:
+        return CARD_MAP[key]
+    best = None
+    for k, v in CARD_MAP.items():
+        if key.startswith(k) or k in key:
+            if not best or len(k) > len(best[0]):
+                best = (k, v)
+    return best[1] if best else None
 
 # =================== PriceCharting HTTP Helpers =================
 
@@ -301,7 +411,7 @@ def _closest_grade(target_brand: Optional[str], target_num: Optional[str],
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "price-api", "version": "1.2"}
+    return {"status": "ok", "service": "price-api", "version": "1.3"}
 
 @app.get("/health")
 def health():
@@ -314,8 +424,13 @@ def search(
     number: Optional[str] = None,
     year: Optional[str] = None,
 ):
-    # Parse hints from name as a convenience
+    # Parse hints from name as a convenience + mapping
     base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
+    m = mapping_hints(base_name)
+    if m:
+        set = set or m.get("set")
+        number = number or m.get("number")
+        year = year or m.get("year")
     set = set or auto_set
     number = number or auto_num
     year = year or auto_year
@@ -344,8 +459,13 @@ def get_card_price(
     allow_fallback: bool = Query(True, description="Use nearest grade if exact grade not found"),
     response: Response = None,
 ):
-    # Allow hints in name
+    # Allow hints in name + mapping
     base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
+    mapping = mapping_hints(base_name)
+    if mapping:
+        set = set or mapping.get("set")
+        number = number or mapping.get("number")
+        year = year or mapping.get("year")
     set = set or auto_set
     number = number or auto_num
     year = year or auto_year
@@ -358,6 +478,7 @@ def get_card_price(
             response.headers["X-Matched-Grade"] = ""
             response.headers["X-Product-Id"] = ""
             response.headers["X-Query-Used"] = base_name
+            response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
         return {"name": name, "grade": grade, "price": None, "url": "", "query_used": base_name}
 
     product_id = product.get("product_id")
@@ -371,6 +492,7 @@ def get_card_price(
             response.headers["X-Matched-Grade"] = ""
             response.headers["X-Product-Id"] = product_id or ""
             response.headers["X-Query-Used"] = query_used or base_name
+            response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
         return {
             "name": product_name, "grade": grade, "price": None,
             "url": product_url, "product_id": product_id, "query_used": query_used or base_name
@@ -421,6 +543,7 @@ def get_card_price(
         response.headers["X-Matched-Grade"] = matched_label or ""
         response.headers["X-Product-Id"] = product_id or ""
         response.headers["X-Query-Used"] = query_used or base_name
+        response.headers["X-Mapping-Hit"] = "true" if mapping else "false"
 
     return {
         "name": product_name,
@@ -441,6 +564,11 @@ def get_all_prices(
     year: Optional[str] = Query(None, description="Year hint"),
 ):
     base_name, auto_set, auto_num, auto_year = _parse_name_hints(name)
+    mapping = mapping_hints(base_name)
+    if mapping:
+        set = set or mapping.get("set")
+        number = number or mapping.get("number")
+        year = year or mapping.get("year")
     set = set or auto_set
     number = number or auto_num
     year = year or auto_year
