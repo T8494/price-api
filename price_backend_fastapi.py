@@ -1,56 +1,46 @@
+# price_backend_fastapi.py
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
-import math
+import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
+
+app = FastAPI(title="Price API (PriceCharting)", version="2.0")
 
 # -----------------------------
 # Config
 # -----------------------------
-# Read your token from env if set, otherwise use the existing one you provided earlier.
-API_TOKEN = os.environ.get(
-    "PRICECHARTING_KEY",
-    "196b4a540c432122ca7124335c02a1cdd1253c46"
-)
+API_TOKEN = os.getenv("PRICECHARTING_API_KEY", "").strip() or "196b4a540c432122ca7124335c02a1cdd1253c46"
+API_BASE = "https://www.pricecharting.com/api"
+CSV_URL_TEMPLATE = "https://www.pricecharting.com/price-guide/download-custom?t={token}&category=pokemon-cards"
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; price-api/2.0; +https://price-api)"}
 
-BASE = "https://www.pricecharting.com"
-API_PRODUCTS = f"{BASE}/api/products"
-API_PRODUCT = f"{BASE}/api/product"
-SEARCH_PAGE = f"{BASE}/search-products"
+# CSV cache (in-memory)
+_csv_rows: List[Dict[str, str]] = []
+_csv_loaded_at: Optional[datetime] = None
+_CSV_MAX_AGE = timedelta(hours=24)  # refresh at most daily
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.7",
-    "Connection": "keep-alive",
-    "Referer": BASE,
+# Heuristics for CSV column names (PriceCharting varies a bit by category/export)
+_ID_CANDIDATES = {"id", "product_id", "product-id", "game-id"}
+_NAME_CANDIDATES = {
+    "product_name", "product-name", "title", "name", "card_name", "card-name"
 }
+_SET_CANDIDATES = {"set", "set_name", "set-name", "series"}
+_NUM_CANDIDATES = {"number", "card_number", "card-number", "num"}
+_YEAR_CANDIDATES = {"year", "release_year", "release-year"}
 
-app = FastAPI(title="Price API (PriceCharting-backed)")
 
 # -----------------------------
 # Models
 # -----------------------------
-class SearchHit(BaseModel):
-    product_id: str
-    name: str
-    url: str
-    score: float
-
-
-class PricesResponse(BaseModel):
-    name: str
-    url: str
-    graded_prices: Dict[str, Optional[float]]
-
-
 class PriceResponse(BaseModel):
     name: str
     grade: str
@@ -59,282 +49,245 @@ class PriceResponse(BaseModel):
 
 
 # -----------------------------
-# Helpers: text, matching, HTTP
+# Helpers
 # -----------------------------
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-CARDNO_RE = re.compile(r"\b(\d{1,3})\s*/\s*(\d{1,3})\b", re.IGNORECASE)
+def _normalize(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^\w\s]", " ", s)  # remove punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def normalize_query(q: str) -> str:
-    # remove years (they hurt search sometimes), collapse spaces
-    q = YEAR_RE.sub("", q)
-    # keep slash in card numbers, strip extra punctuation
-    q = re.sub(r"[^\w\s/'\-\[\]]+", " ", q)
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
 
-def tokens(s: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", s.lower())
+def _download_csv_if_needed(force: bool = False) -> None:
+    """Download + cache CSV to memory if missing or stale."""
+    global _csv_rows, _csv_loaded_at
 
-def contains_all(needles: List[str], hay: str) -> bool:
-    h = hay.lower()
-    return all(n.lower() in h for n in needles if n)
+    if not force and _csv_loaded_at and datetime.utcnow() - _csv_loaded_at < _CSV_MAX_AGE:
+        return
 
-def score_result(name: str, query: str) -> float:
-    """
-    Simple heuristic score:
-    + token overlap
-    + card number presence
-    + edition/shadowless matching
-    """
-    q_tokens = set(tokens(query))
-    n_tokens = set(tokens(name))
-    overlap = len(q_tokens & n_tokens)
-
-    score = overlap
-
-    # card number bonus
-    q_no = CARDNO_RE.search(query)
-    if q_no and CARDNO_RE.search(name):
-        score += 2.5
-
-    # edition/shadowless hints
-    if contains_all(["1st", "edition"], query) and "1st edition" in name.lower():
-        score += 2.0
-    if "shadowless" in query.lower() and "shadowless" in name.lower():
-        score += 2.0
-
-    # slight boost for "base set" when present in both
-    if "base" in q_tokens and "set" in q_tokens and "base" in n_tokens and "set" in n_tokens:
-        score += 1.0
-
-    return float(score)
-
-def http_get_json(url: str, params: dict) -> Optional[dict | list]:
+    url = CSV_URL_TEMPLATE.format(token=API_TOKEN)
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except requests.RequestException:
-        return None
-
-def http_get_html(url: str, params: dict) -> Optional[str]:
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        if r.status_code == 200:
-            return r.text
-        return None
-    except requests.RequestException:
-        return None
+        r = requests.get(url, headers=USER_AGENT, timeout=60)
+        r.raise_for_status()
+        # Some browsers save as .csv.csv — but here we read straight from response
+        content = r.content.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(content))
+        _csv_rows = [dict(row) for row in reader if any(row.values())]
+        _csv_loaded_at = datetime.utcnow()
+        print(f"[csv] Loaded {len(_csv_rows)} rows at {_csv_loaded_at.isoformat()} UTC")
+    except Exception as e:
+        # If it fails, just keep the existing cache (may be empty on first boot)
+        print(f"[csv] Failed to download/parse CSV: {e}")
 
 
-# -----------------------------
-# PriceCharting lookups
-# -----------------------------
-def api_search_products(query: str) -> List[dict]:
-    data = http_get_json(API_PRODUCTS, {"search_term": query, "key": API_TOKEN})
-    if not isinstance(data, list):
-        return []
-    return data
+def _csv_headers() -> Tuple[set, set, set, set, set]:
+    """Return the actual header names present for id/name/set/num/year."""
+    if not _csv_rows:
+        return set(), set(), set(), set(), set()
+    headers = set(_csv_rows[0].keys())
+    ids = {h for h in headers if h.lower() in _ID_CANDIDATES}
+    names = {h for h in headers if h.lower() in _NAME_CANDIDATES}
+    sets = {h for h in headers if h.lower() in _SET_CANDIDATES}
+    nums = {h for h in headers if h.lower() in _NUM_CANDIDATES}
+    years = {h for h in headers if h.lower() in _YEAR_CANDIDATES}
+    return ids, names, sets, nums, years
 
-def select_best_product(results: List[dict], user_query: str) -> Optional[dict]:
-    if not results:
-        return None
-    # Score each candidate by name
-    scored: List[Tuple[float, dict]] = []
-    for item in results:
-        name = item.get("product_name") or item.get("console_name") or ""
-        s = score_result(name, user_query)
-        scored.append((s, item))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    # require minimal score
-    best_score, best_item = scored[0]
-    if best_score <= 0:
-        return None
-    return best_item
 
-def scrape_search_for_slug(query: str) -> Optional[str]:
-    """
-    Fallback: open the search page and grab the first product slug after '/game/'.
-    We use that slug as `product_id` for the /api/product endpoint.
-    """
-    html = http_get_html(SEARCH_PAGE, {"q": query})
-    if not html:
-        return None
+def _row_display_name(row: Dict[str, str]) -> str:
+    """Build a human-ish name from whatever the CSV has."""
+    ids, names, sets, nums, years = _csv_headers()
+    parts: List[str] = []
+    for h in (list(names) + list(sets) + list(nums) + list(years)):
+        v = row.get(h) or ""
+        if v:
+            parts.append(str(v))
+    return " ".join(parts).strip() or next(iter(names), "name")
 
-    # Simple href extraction to avoid fragile full HTML parsing
-    # Look for links like href="/game/pokemon-base-set/charizard-4"
-    m = re.search(r'href="(/game/[^"#?]+)"', html, flags=re.IGNORECASE)
-    if not m:
-        return None
-    path = m.group(1)
-    # convert to product_id expected by the API: everything after '/game/'
-    if path.lower().startswith("/game/"):
-        return path[len("/game/"):]
+
+def _row_product_id(row: Dict[str, str]) -> Optional[str]:
+    ids, *_ = _csv_headers()
+    for h in ids:
+        v = str(row.get(h) or "").strip()
+        if v:
+            return v
+    # Some dumps include a URL column we can parse
+    for k, v in row.items():
+        if isinstance(v, str) and "pricecharting.com/game/" in v:
+            m = re.search(r"/game/(\d+)", v)
+            if m:
+                return m.group(1)
     return None
 
-def api_get_product(product_id: str) -> Optional[dict]:
-    data = http_get_json(API_PRODUCT, {"id": product_id, "key": API_TOKEN})
-    if not isinstance(data, dict):
+
+def _csv_search_best_match(query: str) -> Optional[Dict[str, str]]:
+    """Very light-weight matching: all query tokens must appear in concatenated fields."""
+    if not _csv_rows:
         return None
-    return data
+    q = _normalize(query)
+    if not q:
+        return None
+    q_tokens = set(q.split())
 
-def graded_map_from_product(data: dict) -> Dict[str, Optional[float]]:
-    """
-    PriceCharting API returns 'graded_price' as a dict-like object where keys
-    are like 'PSA 10', 'PSA 9', 'BGS 9.5', 'CGC 9', etc. Normalize to uniform keys.
-    """
-    out: Dict[str, Optional[float]] = {}
-    g = data.get("graded_price") or {}
-    if isinstance(g, dict):
-        for k, v in g.items():
-            key = str(k).strip()
-            try:
-                val = float(v) if v is not None and v != "" else None
-            except Exception:
-                val = None
-            out[key] = val
-    return out
+    ids, names, sets, nums, years = _csv_headers()
+    candidates = names or {"name"}  # fallback – we’ll just join all fields
 
-def build_product_url(product_id: str) -> str:
-    # Product pages are under /game/{slug}
-    return f"{BASE}/game/{product_id}"
+    best_row = None
+    best_score = -1
+
+    for row in _csv_rows:
+        chunks: List[str] = []
+        picked = False
+        for h in (list(names) + list(sets) + list(nums) + list(years)):
+            v = row.get(h)
+            if v:
+                picked = True
+                chunks.append(str(v))
+        if not picked:
+            # If we couldn't identify likely columns, join *some* text columns
+            chunks = [str(v) for v in row.values() if isinstance(v, str)]
+
+        hay = _normalize(" ".join(chunks))
+        hay_tokens = set(hay.split())
+
+        # basic containment: all query tokens should be present
+        if not q_tokens.issubset(hay_tokens):
+            continue
+
+        # simple score = number of matching tokens (more is better)
+        score = len(q_tokens & hay_tokens)
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    return best_row
 
 
-# -----------------------------
-# Grade matching
-# -----------------------------
-def normalize_grade_label(label: str) -> str:
-    # unify spaces and case, keep decimals
-    t = re.sub(r"\s+", "", label.upper())
-    return t
+def search_product_id(card_name: str) -> Optional[Dict[str, str]]:
+    """Try API search first; if empty, fall back to CSV to get a product_id."""
+    # 1) API search
+    try:
+        q = card_name.replace(" ", "+")
+        url = f"{API_BASE}/products?search_term={q}&key={API_TOKEN}"
+        resp = requests.get(url, headers=USER_AGENT, timeout=20)
+        if resp.status_code == 200:
+            results = resp.json() or []
+            if results:
+                # already a dict with keys like product_id, product_name
+                return results[0]
+    except Exception as e:
+        print(f"[api] /products failed: {e}")
 
-def find_grade_price(graded: Dict[str, Optional[float]], ask: str) -> Optional[float]:
-    """
-    Ask can be 'PSA 9', 'psa9', 'BGS 9.5', 'CGC 10', etc.
-    We match ignoring spaces/case.
-    """
+    # 2) CSV fallback (find product_id, then we’ll still call the API product endpoint)
+    try:
+        _download_csv_if_needed()
+        row = _csv_search_best_match(card_name)
+        if row:
+            pid = _row_product_id(row)
+            if pid:
+                # Return dict in same shape the code expects
+                return {
+                    "product_id": pid,
+                    "product_name": _row_display_name(row),
+                }
+    except Exception as e:
+        print(f"[csv] search fallback failed: {e}")
+
+    return None
+
+
+def get_product_data(product_id: str) -> Optional[Dict]:
+    """Always uses API product endpoint for authoritative graded prices."""
+    try:
+        url = f"{API_BASE}/product?id={product_id}&key={API_TOKEN}"
+        resp = requests.get(url, headers=USER_AGENT, timeout=20)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception as e:
+        print(f"[api] /product failed: {e}")
+        return None
+
+
+def _match_grade(graded: Dict[str, str], grade_query: str) -> Optional[float]:
+    """Find a graded price whose label contains the requested grade (case-insensitive)."""
     if not graded:
         return None
-    want = normalize_grade_label(ask)
-    # direct match first
-    for k, v in graded.items():
-        if normalize_grade_label(k) == want:
-            return v
-
-    # fallback: tolerate missing space variants ("PSA9" vs "PSA 9")
-    # also handle 'PSA Gem Mint 10' styles, by extracting number and brand
-    m = re.match(r"(PSA|BGS|CGC)\s*([0-9]+(?:\.[05])?)", ask.strip(), flags=re.IGNORECASE)
-    if m:
-        brand = m.group(1).upper()
-        num = m.group(2)
-        candidates = []
-        for k, v in graded.items():
-            nk = normalize_grade_label(k)
-            if nk.startswith(brand) and re.search(rf"{re.escape(num)}$", nk):
-                candidates.append(v)
-        if candidates:
-            # any candidate is fine; usually only one
-            for c in candidates:
-                return c
+    gq = _normalize(grade_query)
+    for label, value in graded.items():
+        if gq in _normalize(label):
+            try:
+                return float(value)
+            except Exception:
+                return None
     return None
 
 
 # -----------------------------
-# Public endpoints
+# Routes
 # -----------------------------
-@app.get("/", tags=["meta"])
+@app.get("/", tags=["health"])
 def root():
-    return {"ok": True, "endpoints": ["/search", "/prices", "/price", "/health"]}
+    return {
+        "ok": True,
+        "service": "price-api",
+        "csv_loaded_rows": len(_csv_rows),
+        "csv_loaded_at": _csv_loaded_at.isoformat() if _csv_loaded_at else None,
+        "now": datetime.utcnow().isoformat() + "Z",
+    }
 
-@app.get("/health", tags=["meta"])
-def health():
-    # lightweight check: token present
-    return {"ok": True, "has_token": bool(API_TOKEN)}
 
-@app.get("/search", response_model=List[SearchHit], tags=["search"])
-def search(name: str = Query(..., description="Card query, e.g. 'Charizard Base Set 4/102 1st Edition'")):
-    """
-    Returns a small list of likely matches with a score so you can choose.
-    """
-    if not name.strip():
-        return []
+@app.get("/search", tags=["search"])
+def search(name: str = Query(..., description="Card search, e.g., 'Charizard Base Set 4/102 1999'")):
+    hit = search_product_id(name)
+    return [] if not hit else [hit]
 
-    q = normalize_query(name)
-    hits: List[SearchHit] = []
 
-    # 1) API search
-    api_results = api_search_products(q)
-    for r in api_results[:10]:
-        pid = r.get("product_id")
-        pname = r.get("product_name") or ""
-        if not pid or not pname:
-            continue
-        s = score_result(pname, q)
-        hits.append(SearchHit(
-            product_id=pid,
-            name=pname,
-            url=build_product_url(pid),
-            score=s
-        ))
-
-    # 2) Fallback: scrape first slug if API empty
-    if not hits:
-        slug = scrape_search_for_slug(q)
-        if slug:
-            pname = normalize_query(name)
-            hits.append(SearchHit(
-                product_id=slug,
-                name=pname,
-                url=build_product_url(slug),
-                score=0.5
-            ))
-
-    # sort by score desc
-    hits.sort(key=lambda h: h.score, reverse=True)
-    return hits
-
-@app.get("/prices", response_model=PricesResponse, tags=["prices"])
-def get_all_prices(name: str = Query(..., description="Card query, e.g., 'Charizard Base Set 4/102 1999'")):
-    if not name.strip():
-        raise HTTPException(status_code=400, detail="name is required")
-
-    q = normalize_query(name)
-
-    # Try API search -> best item
-    best = select_best_product(api_search_products(q), q)
-
-    # Fallback: scrape slug from search page
-    if not best:
-        slug = scrape_search_for_slug(q)
-        if slug:
-            best = {"product_id": slug, "product_name": q}
-
-    if not best:
-        return PricesResponse(name=name, url="", graded_prices={})
-
-    pid = best["product_id"]
-    pdata = api_get_product(pid)
-    if not pdata:
-        return PricesResponse(name=best.get("product_name", name), url=build_product_url(pid), graded_prices={})
-
-    graded = graded_map_from_product(pdata)
-    return PricesResponse(
-        name=pdata.get("product_name", best.get("product_name", name)),
-        url=build_product_url(pid),
-        graded_prices=graded
-    )
-
-@app.get("/price", response_model=PriceResponse, tags=["prices"])
-def get_single_price(
-    name: str = Query(..., description="Card query, e.g., 'Charizard Base Set 4/102 1999'"),
-    grade: str = Query(..., description="Grade, e.g., 'PSA 9', 'BGS 9.5', 'CGC 10'")
+@app.get("/prices", tags=["pricing"])
+def prices(
+    name: str = Query(..., description="Exact card query, e.g., 'Charizard Base Set 4/102 1999'"),
 ):
-    allp = get_all_prices(name)
-    price = find_grade_price(allp.graded_prices, grade)
-    return PriceResponse(
-        name=allp.name,
-        grade=grade,
-        price=price,
-        url=allp.url
-    )
+    """Return all graded prices for a product; tries API search then CSV fallback."""
+    product = search_product_id(name)
+    if not product:
+        return {"name": name, "url": "", "graded_prices": {}}
+
+    pid = str(product.get("product_id"))
+    pdata = get_product_data(pid)
+    graded_prices = (pdata or {}).get("graded_price", {}) or {}
+    url = f"https://www.pricecharting.com/game/{pid}" if pid else ""
+    pname = product.get("product_name") or name
+
+    return {"name": pname, "url": url, "graded_prices": graded_prices}
+
+
+@app.get("/price", response_model=PriceResponse, tags=["pricing"])
+def price(
+    name: str = Query(..., description="Card, e.g., 'Charizard Base Set 4/102 1999'"),
+    grade: str = Query(..., description="Grade, e.g., 'PSA 9'"),
+):
+    product = search_product_id(name)
+    if not product:
+        return {"name": name, "grade": grade, "price": None, "url": ""}
+
+    pid = str(product.get("product_id"))
+    url = f"https://www.pricecharting.com/game/{pid}" if pid else ""
+    pname = product.get("product_name") or name
+
+    pdata = get_product_data(pid)
+    if not pdata:
+        return {"name": pname, "grade": grade, "price": None, "url": url}
+
+    price_val = _match_grade(pdata.get("graded_price", {}) or {}, grade)
+    return {"name": pname, "grade": grade, "price": price_val, "url": url}
+
+
+# -----------------------------
+# Startup: warm the CSV cache (non-blocking if it fails)
+# -----------------------------
+@app.on_event("startup")
+def warm_csv():
+    # Try once at boot; if it fails, we’ll try again lazily on first CSV lookup.
+    try:
+        _download_csv_if_needed(force=True)
+    except Exception as e:
+        print(f"[startup] CSV warm failed: {e}")
