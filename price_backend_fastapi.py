@@ -1,284 +1,246 @@
+# price_backend_fastapi.py
+import os
+import re
+import math
+from difflib import SequenceMatcher
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
 from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List, Tuple
-import os, csv, io, time, requests
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
+APP_NAME = "price-api"
+app = FastAPI(title=APP_NAME, version="1.0.0")
 
-API_TOKEN = os.getenv("PRICECHARTING_API_TOKEN", "196b4a540c432122ca7124335c02a1cdd1253c46")
-CSV_URL = os.getenv("PRICECHARTING_CSV_URL", "").strip()
-CSV_PATH = "/tmp/price-guide.csv"
-CSV_REFRESH_SECS = 60 * 60 * 24  # refresh daily
+# ---------- CSV loading ----------
 
-# ----------- Models
-class PriceResponse(BaseModel):
-    name: str
-    grade: str
-    price: Optional[float]
-    url: str
+def _best_csv_path() -> str:
+    # Prefer an env override (e.g. a Render Secret File path), otherwise repo file
+    env_path = os.getenv("PRICECHARTING_CSV")
+    return env_path if env_path else "price-guide.csv"
 
-class PricesResponse(BaseModel):
-    name: str
-    url: str
-    graded_prices: Dict[str, Optional[float]]
+CSV_PATH = _best_csv_path()
 
-# ----------- HTTP helpers
-_UA = {"User-Agent": "Mozilla/5.0 (compatible; price-api/1.0)"}
+_df: Optional[pd.DataFrame] = None
 
-def get_json(url: str, params: Dict[str, Any] = None) -> Optional[Any]:
-    try:
-        r = requests.get(url, params=params, headers=_UA, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except requests.RequestException:
-        pass
-    return None
-
-# ----------- PriceCharting API helpers
-def pc_search_products(term: str) -> List[Dict[str, Any]]:
-    url = "https://www.pricecharting.com/api/products"
-    return get_json(url, {"search_term": term, "key": API_TOKEN}) or []
-
-def pc_get_product(product_id: str) -> Optional[Dict[str, Any]]:
-    url = "https://www.pricecharting.com/api/product"
-    return get_json(url, {"id": product_id, "key": API_TOKEN})
-
-# ----------- Name normalization
-def _norm(s: str) -> str:
-    return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
-
-# ----------- CSV cache
-_csv_loaded_at: float = 0.0
-_csv_rows: List[Dict[str, str]] = []
-_csv_index: Dict[str, List[int]] = {}  # normalized product-name -> row indices
-
-def _load_csv_if_needed() -> None:
-    global _csv_loaded_at, _csv_rows, _csv_index
-    now = time.time()
-    if _csv_rows and (now - _csv_loaded_at) < CSV_REFRESH_SECS:
-        return
-
-    # If we already have a local copy and it's fresh enough, use it
-    if os.path.exists(CSV_PATH) and (now - os.path.getmtime(CSV_PATH)) < CSV_REFRESH_SECS:
-        data = open(CSV_PATH, "rb").read()
-    else:
-        if not CSV_URL:
-            # No CSV configured
-            _csv_rows, _csv_index = [], {}
-            _csv_loaded_at = now
-            return
-        # Download fresh copy
-        try:
-            r = requests.get(CSV_URL, headers=_UA, timeout=60)
-            r.raise_for_status()
-            data = r.content
-            # Persist to /tmp (ephemeral but fine for our use)
-            with open(CSV_PATH, "wb") as f:
-                f.write(data)
-        except requests.RequestException:
-            # If download fails but we have a previous local file, keep using it
-            if os.path.exists(CSV_PATH):
-                data = open(CSV_PATH, "rb").read()
-            else:
-                _csv_rows, _csv_index = [], {}
-                _csv_loaded_at = now
-                return
-
-    # Parse
-    _csv_rows = []
-    _csv_index = {}
-    with io.StringIO(data.decode("utf-8", errors="ignore")) as buf:
-        reader = csv.DictReader(buf)
-        for i, row in enumerate(reader):
-            _csv_rows.append(row)
-            key = _norm(row.get("product-name", ""))
-            if not key:
-                continue
-            _csv_index.setdefault(key, []).append(i)
-
-    _csv_loaded_at = now
-
-def _csv_candidates(name: str) -> List[Dict[str, str]]:
-    _load_csv_if_needed()
-    if not _csv_rows:
-        return []
-    key = _norm(name)
-    idxs = _csv_index.get(key, [])
-    if idxs:
-        return [_csv_rows[i] for i in idxs]
-
-    # loose match: prefix hit on first 30 chars
-    prefix = key[:30]
-    hits = []
-    for k, indices in _csv_index.items():
-        if k.startswith(prefix):
-            hits.extend(_csv_rows[i] for i in indices)
-            if len(hits) >= 10:
-                break
-    return hits
-
-def _csv_best_match(name: str) -> Optional[Dict[str, str]]:
-    cands = _csv_candidates(name)
-    if not cands:
+def _safe_money(v: Any) -> Optional[float]:
+    """Convert '$1,234.56' or '1234.56' to float; return None when empty/NaN."""
+    if v is None:
         return None
-    # simple ranking: exact norm equality first, else shortest Levenshtein-ish by length gap
-    n = _norm(name)
-    exact = [r for r in cands if _norm(r.get("product-name","")) == n]
-    if exact:
-        return exact[0]
-    return sorted(cands, key=lambda r: abs(len(_norm(r.get("product-name",""))) - len(n)))[0]
+    if isinstance(v, (int, float)) and not math.isnan(v):
+        return float(v)
+    s = str(v).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return None
+    s = s.replace("$", "").replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-def _csv_graded_prices(row: Dict[str, str]) -> Dict[str, Optional[float]]:
-    out: Dict[str, Optional[float]] = {}
-    # The CSV provides columns like bgs-10-price, condition-10-price, condition-9-price, graded-price, etc.
-    # We’ll expose a few common labels. Extend as needed.
-    mapping: List[Tuple[str, str]] = [
-        ("BGS 10", "bgs-10-price"),
-        ("PSA 10", "condition-10-price"),
-        ("PSA 9",  "condition-9-price"),
-        ("PSA 8",  "condition-8-price"),
-        ("CGC 9.5","condition-9.5-price"),  # may or may not exist
-        ("Graded (avg)", "graded-price"),
-    ]
-    for label, col in mapping:
-        v = row.get(col, "")
+def _normalize(s: str) -> str:
+    s = s.lower()
+    # Keep letters, numbers, slashes, and spaces; collapse spaces
+    s = re.sub(r"[^a-z0-9/\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _extract_year(text: str) -> Optional[str]:
+    m = re.search(r"\b(19|20)\d{2}\b", text)
+    return m.group(0) if m else None
+
+def _load_csv() -> pd.DataFrame:
+    df = pd.read_csv(CSV_PATH)
+    # Standardize column names just in case
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # The PriceCharting CSV uses at least these:
+    # 'id', 'console-name', 'product-name', 'loose-price', 'cib-price', 'new-price', 'graded-price', 'release-date'
+    # Some may be missing for trading cards; code tolerates missing columns.
+
+    # Create a year column (best-effort)
+    if "release-date" in df.columns:
+        years = []
+        for v in df["release-date"].fillna(""):
+            # often like "1998-06-01"; take the first 4 digits if it looks like a year
+            m = re.match(r"^(\d{4})", str(v))
+            years.append(m.group(1) if m else "")
+        df["year"] = years
+    else:
+        df["year"] = ""
+
+    # Build a display name and a fuzzy "blob"
+    console = df["console-name"].fillna("").astype(str)
+    product = df["product-name"].fillna("").astype(str)
+    year = df["year"].fillna("").astype(str)
+
+    df["display_name"] = (product.str.strip() + " " + console.str.strip() + " " + year).str.strip()
+    df["search_blob"] = (console + " " + product + " " + year).map(_normalize)
+
+    return df
+
+def _df_ready() -> pd.DataFrame:
+    global _df
+    if _df is None:
         try:
-            out[label] = float(v.replace("$","").replace(",","")) if v else None
-        except:
-            out[label] = None
-    return out
+            _df = _load_csv()
+            print(f"[startup] Loaded CSV: {CSV_PATH} with {len(_df)} rows")
+        except Exception as e:
+            print(f"[startup] ERROR loading CSV '{CSV_PATH}': {e}")
+            # Empty DF to keep service alive; endpoints will return []
+            _df = pd.DataFrame(columns=[
+                "id","console-name","product-name","display_name","search_blob",
+                "loose-price","cib-price","new-price","graded-price","year"
+            ])
+    return _df
 
-# ----------- Public endpoints
+@app.on_event("startup")
+def _on_startup():
+    _ = _df_ready()
+
+
+# ---------- Fuzzy matching ----------
+
+def _score(query_norm: str, candidate_norm: str) -> float:
+    """
+    Blend difflib ratio with small bonuses for exact token hits (year, set numbers like 4/102).
+    """
+    ratio = SequenceMatcher(None, query_norm, candidate_norm).ratio()
+
+    # Bonus if exact year token appears
+    year = _extract_year(query_norm)
+    if year and f" {year} " in f" {candidate_norm} ":
+        ratio += 0.08
+
+    # Bonus for seeing set number like "4/102"
+    sn = re.search(r"\b\d+/\d+\b", query_norm)
+    if sn and sn.group(0) in candidate_norm:
+        ratio += 0.12
+
+    # Cap
+    return min(ratio, 1.0)
+
+def _best_matches(query: str, k: int = 10) -> pd.DataFrame:
+    df = _df_ready()
+    if df.empty:
+        return df.head(0)
+
+    qn = _normalize(query)
+    if not qn:
+        return df.head(0)
+
+    # Quick coarse filter: contains ANY of the words (to avoid scoring every row)
+    tokens = [t for t in qn.split() if t]
+    if tokens:
+        mask = pd.Series(False, index=df.index)
+        for t in tokens:
+            mask = mask | df["search_blob"].str.contains(fr"\b{re.escape(t)}\b", na=False)
+        candidates = df[mask].copy()
+    else:
+        candidates = df.copy()
+
+    if candidates.empty:
+        return candidates
+
+    # Score & sort
+    candidates["__score"] = candidates["search_blob"].map(lambda s: _score(qn, s))
+    candidates = candidates.sort_values("__score", ascending=False)
+    return candidates.head(k)
+
+
+# ---------- Helpers to build a response ----------
+
+def _product_url(pid: Any) -> str:
+    # PriceCharting product pages work with /products/<id>
+    return f"https://www.pricecharting.com/products/{pid}"
+
+def _row_prices(row: pd.Series) -> Dict[str, Optional[float]]:
+    cols = row.index
+    return {
+        "loose": _safe_money(row["loose-price"]) if "loose-price" in cols else None,
+        "cib": _safe_money(row["cib-price"]) if "cib-price" in cols else None,
+        "new": _safe_money(row["new-price"]) if "new-price" in cols else None,
+        "graded": _safe_money(row["graded-price"]) if "graded-price" in cols else None,
+    }
+
+def _grade_to_column(grade: str) -> str:
+    """
+    We don't have per-PSA grade in the CSV. Map:
+      - "raw"/"ungraded" → loose-price
+      - everything else (PSA/BGS/CGC etc.) → graded-price
+    """
+    g = grade.lower().strip()
+    if any(x in g for x in ["raw", "ungraded", "loose"]):
+        return "loose-price"
+    return "graded-price"
+
+
+# ---------- Endpoints ----------
 
 @app.get("/")
 def root():
-    return {"ok": True, "endpoints": ["/search?name=", "/prices?name=", "/price?name=&grade="]}
+    return {
+        "ok": True,
+        "endpoints": [
+            "/search?name=",
+            "/price?name=&grade=",
+            "/prices?name=",
+        ],
+        "csv_path": CSV_PATH,
+    }
 
 @app.get("/search")
-def search(name: str = Query(..., description="e.g., 'Charizard Base Set 4/102 1999'")):
-    # 1) Try API
-    api_hits = pc_search_products(name)
-    if api_hits:
-        # Return minimal list
-        return [
-            {
-                "product_id": h.get("product_id"),
-                "product_name": h.get("product_name"),
-                "url": f"https://www.pricecharting.com/game/{h.get('product_id')}",
-            }
-            for h in api_hits
-        ]
+def search(name: str = Query(..., description="Card name, set, number, year (any order)")):
+    rows = _best_matches(name, k=10)
+    out: List[Dict[str, Any]] = []
+    for _, r in rows.iterrows():
+        out.append({
+            "id": int(r["id"]) if "id" in r and pd.notna(r["id"]) else None,
+            "name": r.get("display_name", "").strip(),
+            "url": _product_url(int(r["id"])) if "id" in r and pd.notna(r["id"]) else "",
+            "year": r.get("year", "") or None,
+        })
+    return JSONResponse(out)
 
-    # 2) Fallback: CSV
-    rows = _csv_candidates(name)
-    if not rows:
-        return []
-    return [
-        {
-            "product_id": r.get("id",""),
-            "product_name": r.get("product-name",""),
-            "url": "",  # CSV doesn’t include the web id reliably
-        }
-        for r in rows[:10]
-    ]
-
-@app.get("/prices", response_model=PricesResponse)
-def prices(name: str = Query(..., description="Card name + set/year helps specificity")):
-    # 1) API first
-    hits = pc_search_products(name)
-    if hits:
-        best = hits[0]
-        pid = best.get("product_id")
-        pdata = pc_get_product(pid) if pid else None
-        graded = pdata.get("graded_price", {}) if pdata else {}
-        # Convert values to floats where we can
-        out = {}
-        for k, v in graded.items():
-            try:
-                out[k] = float(v)
-            except:
-                out[k] = None
-        return {
-            "name": best.get("product_name", name),
-            "url": f"https://www.pricecharting.com/game/{pid}" if pid else "",
-            "graded_prices": out,
-        }
-
-    # 2) CSV fallback
-    row = _csv_best_match(name)
-    if not row:
-        return {"name": name, "url": "", "graded_prices": {}}
-    return {
-        "name": row.get("product-name",""),
-        "url": "",
-        "graded_prices": _csv_graded_prices(row),
-    }
-
-@app.get("/price", response_model=PriceResponse)
+@app.get("/price")
 def price(
-    name: str = Query(..., description="Card name, e.g., Charizard Base Set 4/102 1999"),
-    grade: str = Query(..., description="e.g., PSA 9, PSA 10, CGC 9.5, BGS 10"),
+    name: str = Query(..., description="Card name, set, number, year (any order)"),
+    grade: str = Query("", description='e.g., "PSA 9", "BGS 9.5", "Raw/Ungraded"')
 ):
-    # 1) API first
-    hits = pc_search_products(name)
-    if hits:
-        best = hits[0]
-        pid = best.get("product_id")
-        pdata = pc_get_product(pid) if pid else None
-        graded = pdata.get("graded_price", {}) if pdata else {}
-        # Try to match grade label loosely
-        target = grade.upper()
-        val = None
-        for k, v in graded.items():
-            if target in k.upper():
-                try:
-                    val = float(v)
-                except:
-                    val = None
-                break
-        return {
-            "name": best.get("product_name", name),
-            "grade": grade,
-            "price": val,
-            "url": f"https://www.pricecharting.com/game/{pid}" if pid else "",
+    rows = _best_matches(name, k=1)
+    if rows.empty:
+        return JSONResponse({"name": name, "grade": grade, "price": None, "url": ""})
+
+    r = rows.iloc[0]
+    col = _grade_to_column(grade or "")
+    price_val = None
+    if col in r.index:
+        price_val = _safe_money(r[col])
+
+    return JSONResponse({
+        "name": r.get("display_name", "").strip() or name,
+        "grade": grade or ("Raw" if col == "loose-price" else "Graded"),
+        "price": price_val,
+        "url": _product_url(int(r["id"])) if "id" in r and pd.notna(r["id"]) else "",
+    })
+
+@app.get("/prices")
+def prices(name: str = Query(..., description="Card name, set, number, year (any order)")):
+    rows = _best_matches(name, k=1)
+    if rows.empty:
+        return JSONResponse({"name": name, "url": "", "graded_prices": {}})
+
+    r = rows.iloc[0]
+    price_bundle = _row_prices(r)
+
+    return JSONResponse({
+        "name": r.get("display_name", "").strip() or name,
+        "url": _product_url(int(r["id"])) if "id" in r and pd.notna(r["id"]) else "",
+        "graded_prices": {
+            # consistent keys for your overlay app
+            "Raw": price_bundle["loose"],
+            "Graded": price_bundle["graded"],
+            "New": price_bundle["new"],
+            "CIB": price_bundle["cib"],
         }
-
-    # 2) CSV fallback
-    row = _csv_best_match(name)
-    if not row:
-        return {"name": name, "grade": grade, "price": None, "url": ""}
-
-    # Map grade to column approx
-    gmap = {
-        "BGS 10": "bgs-10-price",
-        "PSA 10": "condition-10-price",
-        "PSA 9":  "condition-9-price",
-        "PSA 8":  "condition-8-price",
-        "CGC 9.5":"condition-9.5-price",
-        "GRADED": "graded-price",
-    }
-    col = None
-    # best-effort: exact then contains
-    for k, c in gmap.items():
-        if grade.strip().upper() == k:
-            col = c; break
-    if not col:
-        for k, c in gmap.items():
-            if k in grade.strip().upper():
-                col = c; break
-    if not col:
-        col = "graded-price"
-
-    raw = row.get(col, "")
-    val = None
-    try:
-        val = float(raw.replace("$","").replace(",","")) if raw else None
-    except:
-        val = None
-
-    return {
-        "name": row.get("product-name",""),
-        "grade": grade,
-        "price": val,
-        "url": "",
-    }
+    })
